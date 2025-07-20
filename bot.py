@@ -1,242 +1,150 @@
-import asyncio
-import csv
-from datetime import datetime
+import os
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import (
-    KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
-)
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
-API_TOKEN = "7635754983:AAEoLA9QU0Aebg-M7a7NjRkZWUPKK5JrWaY"
-ADMIN_CHAT_ID = 7569576915
+# Получаем токен и ID администратора из переменных окружения
+BOT_TOKEN = os.getenv("7635754983:AAEoLA9QU0Aebg-M7a7NjRkZWUPKK5JrWaY")
+ADMIN_CHAT_ID = int(os.getenv("7569576915"))
 
-bot = Bot(token=API_TOKEN)
+# Создание бота и диспетчера
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Хранилище для заказов
 user_data = {}
 
-# Клавиатуры
+# Стартовая клавиатура
 def start_keyboard():
-    return ReplyKeyboardBuilder().add(
-        KeyboardButton(text="🛒 Сделать новый заказ"),
-        KeyboardButton(text="💡 Предложить улучшение")
-    ).as_markup(resize_keyboard=True)
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="🛒 Новый заказ")
+    return kb.as_markup(resize_keyboard=True)
 
-def phone_keyboard():
-    return ReplyKeyboardBuilder().add(
-        KeyboardButton(text="📱 Отправить номер", request_contact=True)
-    ).as_markup(resize_keyboard=True)
-
-def confirm_keyboard():
-    return ReplyKeyboardBuilder().add(
-        KeyboardButton(text="✅ Подтвердить"),
-        KeyboardButton(text="🔙 Назад"),
-        KeyboardButton(text="🚫 Отменить заказ")
-    ).as_markup(resize_keyboard=True)
-
-def admin_inline_keyboard(user_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Подтвердить готовность", callback_data=f"ready_{user_id}")
-    ]])
-
-# Сохранение заказа
-def save_order(user_id, name, phone, content, address, payment):
-    with open("orders.csv", "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([datetime.now().isoformat(), user_id, name, phone, content, address, payment])
-
-# Отправка админу
-async def notify_admin(user_id, name, phone, content, address, payment, photo_id=None):
-    text = (
-        f"📦 *Новый заказ!*\n"
-        f"👤 *Имя:* {name} (ID: `{user_id}`)\n"
-        f"📞 *Телефон:* {phone}\n"
-        f"📍 *Адрес:* {address}\n"
-        f"🛒 *Заказ:* {content}\n"
-        f"💳 *Оплата:* {payment}"
-    )
-    markup = admin_inline_keyboard(user_id)
-    if photo_id:
-        await bot.send_photo(ADMIN_CHAT_ID, photo=photo_id, caption=text, parse_mode="Markdown", reply_markup=markup)
-    else:
-        await bot.send_message(ADMIN_CHAT_ID, text, parse_mode="Markdown", reply_markup=markup)
-
-# Старт
-@dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    user_id = message.from_user.id
-    user_data[user_id] = {"name": message.from_user.full_name}
-    await message.answer(
-        f"👋 Привет, {message.from_user.full_name}!\nЧтобы оформить заказ, нажми 🛒",
-        reply_markup=start_keyboard()
+# Клавиатура для отмены и возврата
+def cancel_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔙 Назад")],
+            [KeyboardButton(text="❌ Отменить заказ")]
+        ],
+        resize_keyboard=True
     )
 
-# Контакт
-@dp.message(F.contact)
-async def handle_contact(message: types.Message):
+@dp.message(F.text == "/start")
+async def start_handler(message: types.Message):
     user_id = message.from_user.id
-    user_data.setdefault(user_id, {})["phone"] = message.contact.phone_number
-    await message.answer("📥 Напишите список продуктов:")
+    name = message.from_user.full_name
+    user_data[user_id] = {"name": name}
+    await message.answer(f"👋 Привет, {name}! Добро пожаловать в сервис доставки.", reply_markup=start_keyboard())
 
-# Фото
-@dp.message(F.photo)
+@dp.message(F.text == "🛒 Новый заказ")
+async def new_order(message: types.Message):
+    user_id = message.from_user.id
+    user_data[user_id]["step"] = "get_products"
+    await message.answer("📝 Введите список продуктов:", reply_markup=cancel_keyboard())
+
+@dp.message(F.text == "🔙 Назад")
+async def go_back(message: types.Message):
+    await message.answer("⬅️ Вы вернулись назад.", reply_markup=start_keyboard())
+
+@dp.message(F.text == "❌ Отменить заказ")
+async def cancel_order(message: types.Message):
+    user_data.pop(message.from_user.id, None)
+    await message.answer("❌ Заказ отменён.", reply_markup=start_keyboard())
+
+@dp.message(F.content_type == "photo")
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
-    user_data.setdefault(user_id, {})["photo"] = message.photo[-1].file_id
-    await message.answer("📷 Фото получено. Нажмите ✅ Подтвердить.")
+    if user_id in user_data:
+        photo = message.photo[-1]
+        file_id = photo.file_id
+        user_data[user_id]['photo'] = file_id
+        await message.answer("📸 Фото получено.")
+    else:
+        await message.answer("📸 Фото получено, но у вас нет активного заказа.")
 
-# Подтверждение от админа
-@dp.callback_query(F.data.startswith("ready_"))
-async def handle_admin_ready(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_CHAT_ID:
-        await callback.answer("⛔ Только админ может подтверждать.")
-        return
-
-    user_id = int(callback.data.split("_")[1])
-    state = user_data.get(user_id)
-    if not state:
-        await callback.answer("❗ Заказ не найден.")
-        return
-
-    await bot.send_message(user_id, "🛒 Курьер собрал вашу корзину. Сейчас он укажет итоговую сумму.")
-    await callback.message.answer("Введите итоговую сумму (например: 4700):")
-
-    state["admin_step"] = "waiting_price_input"
-    state["admin_chat_id"] = callback.from_user.id
-    await callback.answer()
-
-# Универсальный обработчик
-@dp.message(F.text)
-async def universal_handler(message: types.Message):
+@dp.message()
+async def handle_text(message: types.Message):
     user_id = message.from_user.id
-    text = message.text.strip()
-    state = user_data.setdefault(user_id, {})
+    state = user_data.get(user_id)
 
-    # Ввод суммы от админа
-    if message.from_user.id == ADMIN_CHAT_ID and text.isdigit():
-        for uid, s in user_data.items():
-            if s.get("admin_step") == "waiting_price_input":
-                s["total_price"] = text
-                s["awaiting_payment"] = True
-                s["admin_step"] = None
-
-                await bot.send_message(
-                    uid,
-                    f"💰 Общая сумма заказа: {text}₸ (включая доставку).\n\n"
-                    f"💳 Оплатите переводом через *Kaspi* на номер *+77762266381* "
-                    f"и нажмите кнопку \"💸 Оплата произведена\".",
-                    parse_mode="Markdown",
-                    reply_markup=ReplyKeyboardBuilder().add(
-                        KeyboardButton(text="💸 Оплата произведена")
-                    ).as_markup(resize_keyboard=True)
-                )
-                await message.answer("✅ Сумма отправлена клиенту.")
-                return
-
-    # Обратная связь
-    if state.get("feedback"):
-        await bot.send_message(ADMIN_CHAT_ID, f"💡 Предложение от {state['name']}:\n{text}")
-        state.pop("feedback")
-        await message.answer("✅ Спасибо! Ваше предложение получено.", reply_markup=start_keyboard())
+    if not state or "step" not in state:
+        await message.answer("❗ Нажмите «🛒 Новый заказ» для начала.")
         return
 
-    # Новый заказ после завершения
-    if state.get("finished"):
-        if text == "🛒 Сделать новый заказ":
-            user_data[user_id] = {"name": message.from_user.full_name}
-            await message.answer("📱 Отправьте номер телефона:", reply_markup=phone_keyboard())
-        else:
-            await message.answer("ℹ️ Заказ уже оформлен. Нажмите 🛒, чтобы начать новый.")
+    if state["step"] == "get_products":
+        state["products"] = message.text
+        state["step"] = "get_address"
+        await message.answer("📍 Введите адрес доставки:", reply_markup=cancel_keyboard())
         return
 
-    # Предложение
-    if text == "💡 Предложить улучшение":
-        state["feedback"] = True
-        await message.answer("✍ Напишите ваше предложение:")
-        return
-
-    # Отмена
-    if text == "🚫 Отменить заказ":
-        user_data.pop(user_id, None)
-        await message.answer("🚫 Заказ отменён.", reply_markup=start_keyboard())
-        return
-
-    # Назад
-    if text == "🔙 Назад":
-        for key in ["photo", "address", "products"]:
-            if key in state:
-                state.pop(key)
-                await message.answer(f"🔁 Назад. Введите {key}.")
-                return
-        await start_cmd(message)
-        return
-
-    # Новый заказ
-    if text == "🛒 Сделать новый заказ":
-        user_data[user_id] = {"name": message.from_user.full_name}
-        await message.answer("📱 Отправьте номер телефона:", reply_markup=phone_keyboard())
-        return
-
-    # Шаги
-    if "phone" not in state:
-        await message.answer("📱 Сначала отправьте номер телефона.", reply_markup=phone_keyboard())
-        return
-
-    if "products" not in state:
-        state["products"] = text
-        await message.answer("📍 Укажите адрес доставки:")
-        return
-
-    if "address" not in state:
-        state["address"] = text
-        state["payment"] = "не указан"
-        await message.answer("📸 Прикрепите фото (если нужно) или нажмите ✅ Подтвердить.", reply_markup=confirm_keyboard())
-        return
-
-    if text == "✅ Подтвердить":
-        await notify_admin(
-            user_id, state["name"], state["phone"],
-            state["products"], state["address"],
-            state["payment"], state.get("photo")
+    if state["step"] == "get_address":
+        state["address"] = message.text
+        state["step"] = "confirm"
+        name = state.get("name", "пользователь")
+        await message.answer(
+            f"🛒 Подтвердите заказ:\n\n"
+            f"👤 Имя: {name}\n"
+            f"📍 Адрес: {state['address']}\n"
+            f"📝 Продукты:\n{state['products']}\n\n"
+            f"Стоимость доставки по центру: 800₸\n"
+            f"В отдалённые районы: +300₸",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="✅ Подтвердить заказ")],
+                    [KeyboardButton(text="❌ Отменить заказ")]
+                ],
+                resize_keyboard=True
+            )
         )
-        save_order(user_id, state["name"], state["phone"], state["products"], state["address"], state["payment"])
-        state["finished"] = False
-        await message.answer("✅ Заказ оформлен. Ожидайте подтверждения от курьера.", reply_markup=ReplyKeyboardRemove())
         return
 
-    if text == "💸 Оплата произведена":
-        if not state.get("awaiting_payment"):
-            await message.answer("⛔ Нет ожидающей оплаты.")
+    if state["step"] == "confirm":
+        if message.text == "✅ Подтвердить заказ":
+            content = state["products"]
+            address = state["address"]
+            photo_id = state.get("photo")
+
+            text = (
+                f"📦 Новый заказ от {state['name']} (ID: {user_id})\n\n"
+                f"📍 Адрес: {address}\n"
+                f"📝 Продукты:\n{content}"
+            )
+
+            if photo_id:
+                await bot.send_photo(ADMIN_CHAT_ID, photo=photo_id, caption=text)
+            else:
+                await bot.send_message(ADMIN_CHAT_ID, text)
+
+            await message.answer("✅ Заказ отправлен. Ожидайте подтверждения от курьера.",
+                                 reply_markup=ReplyKeyboardRemove())
+
+            user_data[user_id]['step'] = "waiting_payment"
             return
 
-        await bot.send_message(
-            ADMIN_CHAT_ID,
-            f"✅ Оплата подтверждена клиентом {state['name']} (ID: {user_id})"
-        )
+        elif message.text == "❌ Отменить заказ":
+            user_data.pop(user_id, None)
+            await message.answer("❌ Заказ отменён.", reply_markup=start_keyboard())
+            return
 
-        state["awaiting_payment"] = False
-        state["finished"] = True
+    if state["step"] == "waiting_payment":
+        if message.text == "💸 Оплата произведена":
+            await message.answer("✅ Спасибо! Курьер уже выехал к вам.", reply_markup=start_keyboard())
+            user_data.pop(user_id, None)
 
-        await message.answer(
-            "✅ Спасибо! Курьер уже выехал к вам.",
-            reply_markup=ReplyKeyboardRemove()
-        )
+# ==== Webhook для Render ====
 
-        new_order_kb = ReplyKeyboardBuilder().add(
-            KeyboardButton(text="🛒 Сделать новый заказ")
-        ).as_markup(resize_keyboard=True)
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
 
-        await message.answer("🛍 Хотите оформить новый заказ?", reply_markup=new_order_kb)
-        return
+async def on_startup(dispatcher):
+    await bot.set_webhook(WEBHOOK_URL)
 
-# Запуск
-async def main():
-    while True:
-        try:
-            await dp.start_polling(bot)
-        except Exception as e:
-            print(f"Ошибка: {e}")
-            await asyncio.sleep(3)
+app = web.Application()
+SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+setup_application(app, dp, bot=bot)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv('PORT', 10000)))
